@@ -1,0 +1,7 @@
+streamlit>=1.45
+tinydb
+streamlit-cookies-manager
+google-genai
+pandas
+python-dotenv
+pillow
