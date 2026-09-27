@@ -1,173 +1,297 @@
-"""
-Capa de persistencia con TinyDB.
-Cuatro tablas:
-  - usuarios: 1 doc por user_id, con plan, contador freemium y última actividad
-  - tickets:  1 doc por ticket guardado, enlazado por user_id
-  - actividad_ip: 1 doc por análisis con éxito, para el rate limit por IP
-  - eventos: registro simple de eventos para métricas básicas de uso
-"""
-from datetime import datetime, timedelta
-from tinydb import TinyDB, Query
+import json
+import os
+import time
+from datetime import datetime
 
-DB_PATH = "gastos_db.json"
-LIMITE_TICKETS_FREE = 15
+import firebase_admin
+import streamlit as st
+from dotenv import load_dotenv
+from firebase_admin import credentials
+from firebase_admin import firestore as fb_firestore
+from google.cloud import firestore as gcf_firestore  # solo para firestore.Increment
+from google.cloud.firestore_v1.base_query import FieldFilter
 
-# Rate limit por IP: protege el cupo compartido de Gemini (5 RPM en el nivel
-# gratuito) frente a alguien que rota de UUID/cookie para saltarse el
-# freemium, o un bot. No sustituye al contador freemium, lo complementa.
-LIMITE_ANALISIS_POR_IP_HORA = 20
-
-db = TinyDB(DB_PATH)
-usuarios_table = db.table("usuarios")
-tickets_table = db.table("tickets")
-actividad_ip_table = db.table("actividad_ip")
-eventos_table = db.table("eventos")
-
-Usuario = Query()
-Ticket = Query()
-ActividadIP = Query()
-Evento = Query()
+# Cargar variables de entorno locales (.env)
+load_dotenv()
 
 
-def _mes_actual() -> str:
-    return datetime.now().strftime("%Y-%m")
+def _inicializar_firebase():
+    """Igual que en la versión anterior: prueba primero el archivo local
+    (entorno de pruebas), luego st.secrets (Streamlit Cloud), luego una
+    variable de entorno. Sin esto, la app funciona en local pero no
+    encuentra credenciales al desplegar."""
+    if firebase_admin._apps:
+        return fb_firestore.client()
 
+    cred = None
 
-def registrar_evento(tipo: str, user_id: str | None = None) -> None:
-    """Registro mínimo de un evento, sin datos personales más allá del
-    user_id (un UUID, no un dato identificativo real)."""
-    eventos_table.insert({
-        "tipo": tipo,
-        "timestamp": datetime.now().isoformat(),
-        "user_id": user_id,
-    })
+    if os.path.exists("firebase_credentials.json"):
+        cred = credentials.Certificate("firebase_credentials.json")
+    elif os.path.exists("firebase-key.json"):
+        cred = credentials.Certificate("firebase-key.json")
 
+    if not cred:
+        try:
+            if "firebase" in st.secrets:
+                cred = credentials.Certificate(dict(st.secrets["firebase"]))
+        except Exception:
+            pass
 
-def obtener_o_crear_usuario(user_id: str) -> dict:
-    """Devuelve el doc de usuario, creándolo si es nuevo y reseteando
-    el contador si ha cambiado de mes."""
-    usuario = usuarios_table.get(Usuario.user_id == user_id)
-    mes = _mes_actual()
+    if not cred:
+        env_cred = os.environ.get("FIREBASE_CREDENTIALS")
+        if env_cred:
+            cred = credentials.Certificate(json.loads(env_cred))
 
-    if usuario is None:
-        usuario = {
-            "user_id": user_id,
-            "fecha_alta": datetime.now().strftime("%Y-%m-%d"),
-            "plan": "free",
-            "tickets_mes_actual": 0,
-            "mes_contador": mes,
-            "ultima_actividad": datetime.now().isoformat(),
-        }
-        usuarios_table.insert(usuario)
-        registrar_evento("usuario_nuevo", user_id)
-        return usuario
-
-    if usuario.get("mes_contador") != mes:
-        usuarios_table.update(
-            {"tickets_mes_actual": 0, "mes_contador": mes},
-            Usuario.user_id == user_id,
+    if not cred:
+        raise RuntimeError(
+            "No se encontraron credenciales de Firebase. Asegúrate de tener "
+            "'firebase_credentials.json' en la raíz del proyecto, o los Secrets "
+            "configurados en Streamlit Cloud."
         )
-        usuario["tickets_mes_actual"] = 0
-        usuario["mes_contador"] = mes
 
-    return usuario
+    firebase_admin.initialize_app(cred)
+    return fb_firestore.client()
+
+
+# Inicialización de cliente Firestore
+db = _inicializar_firebase()
+
+tickets_col = db.collection("tickets")
+metricas_col = db.collection("metricas")
+ip_analisis_col = db.collection("ip_analisis")
+eventos_col = db.collection("eventos")
+
+LIMITE_TICKETS_FREE = 10
+LIMITE_ANALISIS_IP_POR_HORA = 15
+
+
+def _ahora():
+    return datetime.now().isoformat()
 
 
 def puede_escanear(user_id: str) -> bool:
-    usuario = obtener_o_crear_usuario(user_id)
-    if usuario.get("plan") == "premium":
+    """Verifica si el usuario no ha superado el límite mensual."""
+    doc = metricas_col.document(user_id).get()
+    if not doc.exists:
         return True
-    return usuario.get("tickets_mes_actual", 0) < LIMITE_TICKETS_FREE
+    
+    data = doc.to_dict()
+    mes_actual = datetime.now().strftime("%Y-%m")
+    
+    if data.get("ultimo_mes_analisis") != mes_actual:
+        return True
+        
+    analisis_mes = data.get("analisis_mes_actual", 0)
+    return analisis_mes < LIMITE_TICKETS_FREE
 
 
-def tickets_restantes(user_id: str) -> int | str:
-    usuario = obtener_o_crear_usuario(user_id)
-    if usuario.get("plan") == "premium":
-        return "∞ (premium)"
-    return max(0, LIMITE_TICKETS_FREE - usuario.get("tickets_mes_actual", 0))
+def tickets_restantes(user_id: str) -> int:
+    """Calcula los análisis disponibles del usuario en el mes en curso."""
+    doc = metricas_col.document(user_id).get()
+    if not doc.exists:
+        return LIMITE_TICKETS_FREE
+        
+    data = doc.to_dict()
+    mes_actual = datetime.now().strftime("%Y-%m")
+    
+    if data.get("ultimo_mes_analisis") != mes_actual:
+        return LIMITE_TICKETS_FREE
+        
+    usados = data.get("analisis_mes_actual", 0)
+    return max(0, LIMITE_TICKETS_FREE - usados)
 
 
 def incrementar_contador(user_id: str) -> None:
-    usuario = obtener_o_crear_usuario(user_id)
-    usuarios_table.update(
-        {
-            "tickets_mes_actual": usuario.get("tickets_mes_actual", 0) + 1,
-            "ultima_actividad": datetime.now().isoformat(),
-        },
-        Usuario.user_id == user_id,
-    )
+    """Incrementa los contadores de uso del usuario."""
+    doc_ref = metricas_col.document(user_id)
+    doc = doc_ref.get()
+    mes_actual = datetime.now().strftime("%Y-%m")
+    
+    if not doc.exists:
+        doc_ref.set({
+            "analisis_totales": 1,
+            "analisis_mes_actual": 1,
+            "ultimo_mes_analisis": mes_actual,
+            "creado": _ahora(),
+            "ultima_actividad": _ahora()
+        })
+    else:
+        data = doc.to_dict()
+        if data.get("ultimo_mes_analisis") != mes_actual:
+            doc_ref.update({
+                "analisis_mes_actual": 1,
+                "ultimo_mes_analisis": mes_actual,
+                "analisis_totales": gcf_firestore.Increment(1),
+                "ultima_actividad": _ahora()
+            })
+        else:
+            doc_ref.update({
+                "analisis_mes_actual": gcf_firestore.Increment(1),
+                "analisis_totales": gcf_firestore.Increment(1),
+                "ultima_actividad": _ahora()
+            })
+    # Registrado fuera del if/else: cada análisis debe quedar con su propia
+    # fecha, sea el primero del usuario o no — es lo que permite luego saber
+    # en cuántos días distintos volvió cada persona.
     registrar_evento("analisis_ok", user_id)
 
 
-def guardar_ticket(user_id: str, entrada: dict) -> None:
-    """Guarda un ticket en el historial. No descuenta cupo: el cupo se
-    descuenta al analizar con Gemini (guardar es gratis, analizar no)."""
-    entrada = {**entrada, "user_id": user_id}
-    tickets_table.insert(entrada)
-    registrar_evento("ticket_guardado", user_id)
+def puede_ip_analizar(ip_cliente: str) -> bool:
+    """Control de seguridad anti-abuso por dirección IP."""
+    if not ip_cliente:
+        return True
+    doc = ip_analisis_col.document(ip_cliente).get()
+    if not doc.exists:
+        return True
+    
+    data = doc.to_dict()
+    hace_una_hora = time.time() - 3600
+    peticiones_recientes = [t for t in data.get("timestamps", []) if t > hace_una_hora]
+    return len(peticiones_recientes) < LIMITE_ANALISIS_IP_POR_HORA
 
 
-def obtener_historial(user_id: str) -> list[dict]:
-    tickets = tickets_table.search(Ticket.user_id == user_id)
-    resultado = []
-    for t in tickets:
-        entrada = dict(t)
-        entrada["_doc_id"] = t.doc_id  # necesario para poder borrarlo luego
-        resultado.append(entrada)
-    return sorted(resultado, key=lambda t: t.get("fecha_registro", ""), reverse=True)
-
-
-def borrar_ticket(user_id: str, doc_id: int) -> bool:
-    """Borra un ticket del historial, solo si pertenece a ese user_id
-    (para que nadie pueda borrar tickets ajenos aunque adivine un doc_id)."""
-    ticket = tickets_table.get(doc_id=doc_id)
-    if ticket is None or ticket.get("user_id") != user_id:
-        return False
-    tickets_table.remove(doc_ids=[doc_id])
-    registrar_evento("ticket_borrado", user_id)
-    return True
-
-
-def puede_ip_analizar(ip: str) -> bool:
-    """True si esta IP no ha superado el límite de análisis en la última hora."""
-    if not ip:
-        return True  # sin IP detectada (p. ej. local), no bloqueamos
-    hace_una_hora = (datetime.now() - timedelta(hours=1)).isoformat()
-    llamadas_recientes = actividad_ip_table.count(
-        (ActividadIP.ip == ip) & (ActividadIP.timestamp >= hace_una_hora)
-    )
-    return llamadas_recientes < LIMITE_ANALISIS_POR_IP_HORA
-
-
-def registrar_analisis_ip(ip: str) -> None:
-    """Registra un análisis con éxito para esta IP y limpia registros viejos."""
-    if not ip:
+def registrar_analisis_ip(ip_cliente: str) -> None:
+    """Registra la actividad de una IP."""
+    if not ip_cliente:
         return
-    actividad_ip_table.insert({"ip": ip, "timestamp": datetime.now().isoformat()})
-    # Limpieza: borra registros de más de 24h para que la tabla no crezca sin límite
-    hace_un_dia = (datetime.now() - timedelta(hours=24)).isoformat()
-    actividad_ip_table.remove(ActividadIP.timestamp < hace_un_dia)
+    doc_ref = ip_analisis_col.document(ip_cliente)
+    doc = doc_ref.get()
+    ahora = time.time()
+    
+    if not doc.exists:
+        doc_ref.set({"timestamps": [ahora]})
+    else:
+        hace_una_hora = ahora - 3600
+        peticiones = [t for t in doc.to_dict().get("timestamps", []) if t > hace_una_hora]
+        peticiones.append(ahora)
+        doc_ref.update({"timestamps": peticiones})
+
+
+def ticket_existe_en_historial(user_id: str, hash_imagen: str = None) -> bool:
+    """Comprueba si el ticket ya fue escaneado antes usando su hash de contenido."""
+    if not hash_imagen:
+        return False
+    try:
+        query = tickets_col.where(filter=FieldFilter("user_id", "==", user_id)).where(filter=FieldFilter("hash_imagen", "==", hash_imagen)).limit(1)
+        docs = list(query.stream())
+        return len(docs) > 0
+    except Exception as e:
+        print(f"Error al verificar duplicados en Firestore: {e}")
+        return False
+
+
+def guardar_ticket(user_id: str, entrada: dict) -> bool:
+    """Guarda un ticket evitando duplicaciones si se reintenta una inserción con el mismo hash."""
+    try:
+        hash_img = entrada.get("hash_imagen")
+        if hash_img and ticket_existe_en_historial(user_id, hash_img):
+            return False  # Evita duplicado si ya fue guardado hace un instante
+
+        entrada = {**entrada, "user_id": user_id, "creado": _ahora()}
+        tickets_col.add(entrada)
+        registrar_evento("ticket_guardado", user_id)
+        return True
+    except Exception as e:
+        print(f"Error guardando ticket en Firestore: {e}")
+        return False
+
+
+def obtener_historial(user_id: str) -> list:
+    """Obtiene el historial completo ordenado cronológicamente."""
+    try:
+        query = tickets_col.where(filter=FieldFilter("user_id", "==", user_id))
+        docs = query.stream()
+        historial = []
+        for doc in docs:
+            d = doc.to_dict()
+            d["_doc_id"] = doc.id
+            historial.append(d)
+        
+        def parsear_fecha_orden(item):
+            val = item.get("creado", "")
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            return str(val or "")
+
+        historial.sort(key=parsear_fecha_orden, reverse=True)
+        return historial
+    except Exception as e:
+        print(f"Error consultando historial: {e}")
+        return []
+
+
+def borrar_ticket(user_id: str, doc_id: str) -> bool:
+    """Elimina un ticket del usuario."""
+    try:
+        doc_ref = tickets_col.document(doc_id)
+        doc = doc_ref.get()
+        if doc.exists and doc.to_dict().get("user_id") == user_id:
+            doc_ref.delete()
+            return True
+        return False
+    except Exception as e:
+        print(f"Error borrando ticket: {e}")
+        return False
+
+
+def registrar_evento(tipo_evento: str, user_id: str) -> None:
+    """Métricas y eventos."""
+    try:
+        eventos_col.add({
+            "tipo": tipo_evento,
+            "user_id": user_id,
+            "timestamp": _ahora()
+        })
+    except Exception as e:
+        print(f"Error registrando evento: {e}")
 
 
 def obtener_metricas() -> dict:
-    """Métricas agregadas y anónimas para el panel de admin."""
-    ahora = datetime.now()
-    hace_7d = (ahora - timedelta(days=7)).isoformat()
-    hace_30d = (ahora - timedelta(days=30)).isoformat()
+    """Métricas para administración, basadas en el registro de eventos
+    'analisis_ok' (no en el contador agregado por usuario) — así se puede
+    reconstruir en qué días distintos volvió cada persona, en vez de solo
+    saber cuántos análisis hizo en total."""
+    try:
+        eventos_analisis = list(
+            eventos_col.where(filter=FieldFilter("tipo", "==", "analisis_ok")).stream()
+        )
 
-    todos_usuarios = usuarios_table.all()
-    activos_7d = sum(1 for u in todos_usuarios if u.get("ultima_actividad", "") >= hace_7d)
-    activos_30d = sum(1 for u in todos_usuarios if u.get("ultima_actividad", "") >= hace_30d)
+        dias_por_usuario: dict[str, set] = {}
+        for ev in eventos_analisis:
+            d = ev.to_dict()
+            uid = d.get("user_id")
+            ts = d.get("timestamp")
+            if not uid or not ts:
+                continue
+            fecha_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            dias_por_usuario.setdefault(uid, set()).add(fecha_str)
 
-    todos_eventos = eventos_table.all()
-    analisis_ok = sum(1 for e in todos_eventos if e["tipo"] == "analisis_ok")
-    tickets_guardados = sum(1 for e in todos_eventos if e["tipo"] == "ticket_guardado")
+        total_usuarios = len(list(metricas_col.stream()))
+        activados = len(dias_por_usuario)
+        volvieron_otro_dia = sum(1 for dias in dias_por_usuario.values() if len(dias) > 1)
+        retencion_pct = round(100 * volvieron_otro_dia / activados, 1) if activados else 0.0
+        dias_activos_promedio = (
+            round(sum(len(d) for d in dias_por_usuario.values()) / activados, 1)
+            if activados else 0.0
+        )
 
-    return {
-        "total_usuarios": len(todos_usuarios),
-        "usuarios_activos_7d": activos_7d,
-        "usuarios_activos_30d": activos_30d,
-        "total_analisis_ok": analisis_ok,
-        "total_tickets_guardados": tickets_guardados,
-        "tasa_guardado_pct": round(100 * tickets_guardados / analisis_ok, 1) if analisis_ok else 0,
-    }
+        analisis_ok = len(eventos_analisis)
+        total_guardados = len(list(tickets_col.stream()))
+        tasa_guardado = round((total_guardados / analisis_ok * 100), 1) if analisis_ok else 0.0
+
+        return {
+            "total_usuarios": total_usuarios,
+            "activados": activados,
+            "total_analisis_ok": analisis_ok,
+            "volvieron_otro_dia": volvieron_otro_dia,
+            "retencion_pct": retencion_pct,
+            "dias_activos_promedio": dias_activos_promedio,
+            "tasa_guardado_pct": tasa_guardado
+        }
+    except Exception as e:
+        print(f"Error obteniendo métricas: {e}")
+        return {
+            "total_usuarios": 0, "activados": 0, "total_analisis_ok": 0,
+            "volvieron_otro_dia": 0, "retencion_pct": 0, "dias_activos_promedio": 0,
+            "tasa_guardado_pct": 0
+        }
