@@ -1,7 +1,9 @@
 streamlit>=1.45
-tinydb
+firebase-admin
 streamlit-cookies-manager
 google-genai
 pandas
 python-dotenv
 pillow
+pypdfium2
+pypdfium2
