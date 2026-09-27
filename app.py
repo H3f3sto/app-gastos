@@ -5,6 +5,7 @@ import json
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import PIL.Image
 import pypdfium2 as pdfium
@@ -18,6 +19,8 @@ load_dotenv()
 
 import db
 from auth import get_cookie_manager, obtener_user_id, introducir_codigo_manual
+
+ZONA_MADRID = ZoneInfo("Europe/Madrid")
 
 MAX_REINTENTOS = 3
 ESPERA_BASE_SEGUNDOS = {503: 4, 429: 15}
@@ -329,7 +332,7 @@ with tab_scanner:
                 st.session_state["guardando_ticket"] = True
                 
                 entrada = {
-                    "fecha_registro": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "fecha_registro": datetime.now(ZONA_MADRID).strftime("%Y-%m-%d %H:%M"),
                     "tienda": meta.get("tienda", "Desconocida"),
                     "fecha_ticket": meta.get("fecha", ""),
                     "nif_cif": meta.get("nif_cif", ""),
@@ -403,7 +406,7 @@ with tab_historial:
             st.download_button(
                 label="📥 Descargar CSV",
                 data=csv,
-                file_name=f"historial_gastos_{datetime.now().strftime('%Y%m')}.csv",
+                file_name=f"historial_gastos_{datetime.now(ZONA_MADRID).strftime('%Y%m')}.csv",
                 mime="text/csv"
             )
 
