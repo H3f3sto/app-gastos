@@ -2,6 +2,7 @@ import json
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import firebase_admin
 import streamlit as st
@@ -25,7 +26,11 @@ def _inicializar_firebase():
 
     cred = None
 
-    if os.path.exists("firebase_credentials.json"):
+    # Prioridad en local: si existe la clave de desarrollo, se usa esa
+    # primero, para que tus pruebas nunca toquen los datos de producción.
+    if os.path.exists("firebase_credentials_dev.json"):
+        cred = credentials.Certificate("firebase_credentials_dev.json")
+    elif os.path.exists("firebase_credentials.json"):
         cred = credentials.Certificate("firebase_credentials.json")
     elif os.path.exists("firebase-key.json"):
         cred = credentials.Certificate("firebase-key.json")
@@ -65,8 +70,18 @@ LIMITE_TICKETS_FREE = 10
 LIMITE_ANALISIS_IP_POR_HORA = 15
 
 
+ZONA_MADRID = ZoneInfo("Europe/Madrid")
+
+
 def _ahora():
-    return datetime.now().isoformat()
+    # Fijamos la zona horaria explícitamente: el servidor de Streamlit
+    # Cloud corre en UTC, así que datetime.now() sin zona quedaba 2h
+    # (o 1h en invierno) por detrás de la hora real en España.
+    return datetime.now(ZONA_MADRID).isoformat()
+
+
+def _mes_actual() -> str:
+    return datetime.now(ZONA_MADRID).strftime("%Y-%m")
 
 
 def puede_escanear(user_id: str) -> bool:
@@ -76,7 +91,7 @@ def puede_escanear(user_id: str) -> bool:
         return True
     
     data = doc.to_dict()
-    mes_actual = datetime.now().strftime("%Y-%m")
+    mes_actual = _mes_actual()
     
     if data.get("ultimo_mes_analisis") != mes_actual:
         return True
@@ -92,7 +107,7 @@ def tickets_restantes(user_id: str) -> int:
         return LIMITE_TICKETS_FREE
         
     data = doc.to_dict()
-    mes_actual = datetime.now().strftime("%Y-%m")
+    mes_actual = _mes_actual()
     
     if data.get("ultimo_mes_analisis") != mes_actual:
         return LIMITE_TICKETS_FREE
@@ -105,7 +120,7 @@ def incrementar_contador(user_id: str) -> None:
     """Incrementa los contadores de uso del usuario."""
     doc_ref = metricas_col.document(user_id)
     doc = doc_ref.get()
-    mes_actual = datetime.now().strftime("%Y-%m")
+    mes_actual = _mes_actual()
     
     if not doc.exists:
         doc_ref.set({
