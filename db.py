@@ -66,7 +66,7 @@ metricas_col = db.collection("metricas")
 ip_analisis_col = db.collection("ip_analisis")
 eventos_col = db.collection("eventos")
 
-LIMITE_TICKETS_FREE = 10
+LIMITE_TICKETS_FREE = 20
 LIMITE_ANALISIS_IP_POR_HORA = 15
 
 
