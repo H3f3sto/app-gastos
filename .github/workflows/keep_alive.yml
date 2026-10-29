@@ -1,0 +1,22 @@
+name: Mantener la app despierta
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # cada 6 horas (hora UTC)
+  workflow_dispatch:         # permite lanzarlo a mano desde la pestaña Actions
+
+jobs:
+  visita:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar Playwright y Chromium
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Visitar la app
+        run: python .github/scripts/keep_alive.py
