@@ -2,7 +2,7 @@ name: Mantener la app despierta
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # cada 6 horas (hora UTC)
+    - cron: "17 */4 * * *"   # cada 4 horas (hora UTC)
   workflow_dispatch:         # permite lanzarlo a mano desde la pestaña Actions
 
 jobs:
