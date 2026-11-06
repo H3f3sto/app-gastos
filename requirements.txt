@@ -1,9 +1,8 @@
-streamlit>=1.45
-firebase-admin
-streamlit-cookies-manager
-google-genai
-pandas
-python-dotenv
-pillow
-pypdfium2
-pypdfium2
+streamlit==1.67.0
+firebase-admin==7.7.0
+streamlit-cookies-manager==0.2.0
+google-genai==2.34.0
+pandas==3.1.1
+python-dotenv==1.2.4
+pillow==13.0.0
+pypdfium2==5.14.0
