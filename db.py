@@ -84,7 +84,7 @@ FUNCIONES_PREMIUM = {
     "dividir_pagos": "Dividir pagos: marca qué productos pagaste tú y cuáles otra persona, y calcula cuánto debe cada uno",
     "informes_mensuales": "Informes mensuales: resumen por producto y tienda, comparado con meses anteriores",
 }
-OPCIONES_PRECIO = {"0": "Nada, solo usaría la versión gratuita", "4.99": "4,99 €/mes", "7.99": "7,99 €/mes", "9.99": "9,99 €/mes"}
+OPCIONES_PRECIO = {"0": "Nada, solo usaría la versión gratuita", "1.99": "1,99 €/mes", "2.99": "2,99 €/mes", "4.99": "4,99 €/mes"}
 
 
 ZONA_MADRID = ZoneInfo("Europe/Madrid")
@@ -317,37 +317,93 @@ def _tiendas_parecidas(a: str, b: str) -> bool:
     return SequenceMatcher(None, na, nb).ratio() >= 0.7
 
 
-def buscar_ticket_similar(user_id: str, tienda, fecha, total):
+def _precios(items) -> list:
+    """Lista de precios (redondeados, sin ceros) de los productos de un ticket."""
+    out = []
+    for it in items or []:
+        try:
+            v = round(float(it.get("precio_total")), 2)
+        except (TypeError, ValueError):
+            continue
+        if v == v and v > 0:
+            out.append(v)
+    return out
+
+
+def _solape_precios(a: list, b: list) -> float:
+    """Proporción de precios que coinciden entre dos tickets (0 a 1). Los precios
+    se leen igual aunque la foto cambie, a diferencia de la fecha o el total,
+    que Gemini a veces lee distinto según el encuadre."""
+    if not a or not b:
+        return 0.0
+    from collections import Counter
+    ca, cb = Counter(a), Counter(b)
+    comunes = sum(min(ca[k], cb[k]) for k in ca)
+    return comunes / max(len(a), len(b))
+
+
+def _senales_similitud(t: dict, tienda, fecha_n: str, total: float, precios: list) -> dict:
+    """Señales de que el ticket guardado 't' es el mismo que el que se está analizando."""
+    try:
+        total_t = float(t.get("total", 0))
+    except (TypeError, ValueError):
+        total_t = 0.0
+    try:
+        total_orig_t = float(t.get("total_original", total_t))
+    except (TypeError, ValueError):
+        total_orig_t = total_t
+    # Se compara con el total guardado Y con el del ticket completo (si se guardó
+    # con selección parcial, 'total' es solo lo marcado).
+    total_ok = total > 0 and (abs(total_t - total) < 0.011 or abs(total_orig_t - total) < 0.011)
+    fecha_t = _normalizar_fecha(t.get("fecha_ticket"))
+    fecha_ok = bool(fecha_n) and fecha_t == fecha_n
+    tienda_ok = _tiendas_parecidas(t.get("tienda"), tienda)
+    precios_t = _precios(t.get("items"))
+    solape = _solape_precios(precios, precios_t)
+    solape_ok = min(len(precios), len(precios_t)) >= 3 and solape >= 0.7
+    duplicado = (total_ok and (fecha_ok or tienda_ok)) or solape_ok
+    return {
+        "duplicado": duplicado, "total_ok": total_ok, "fecha_ok": fecha_ok,
+        "tienda_ok": tienda_ok, "solape_precios": round(solape, 2),
+        "n_precios": (len(precios), len(precios_t)),
+    }
+
+
+def buscar_ticket_similar(user_id: str, tienda, fecha, total, items=None):
     """Detecta el MISMO ticket aunque venga de otra foto (el hash de imagen solo
-    detecta archivos idénticos). Criterio: misma fecha, mismo total (±1 céntimo)
-    y tienda parecida. Devuelve el ticket guardado o None. Si faltan fecha o
-    total no se puede decidir y devuelve None."""
+    detecta archivos idénticos). Es duplicado si:
+      - coincide el total (±1 céntimo) y además la fecha o la tienda; o
+      - coinciden la mayoría de los precios de los productos (≥70 %, con al
+        menos 3 productos), que es lo más estable entre dos fotos distintas.
+    Devuelve el ticket guardado o None."""
     try:
         total = float(total)
     except (TypeError, ValueError):
-        return None
+        total = 0.0
     fecha_n = _normalizar_fecha(fecha)
-    if not fecha_n or total <= 0:
-        return None
-
+    precios = _precios(items)
     for t in obtener_historial(user_id):
-        try:
-            total_t = float(t.get("total", 0))
-        except (TypeError, ValueError):
-            continue
-        try:
-            total_orig_t = float(t.get("total_original", total_t))
-        except (TypeError, ValueError):
-            total_orig_t = total_t
-        # Se compara con el total guardado Y con el total original del ticket
-        # completo (si se guardó con selección parcial, 'total' es solo lo marcado).
-        if (
-            (abs(total_t - total) < 0.011 or abs(total_orig_t - total) < 0.011)
-            and _normalizar_fecha(t.get("fecha_ticket")) == fecha_n
-            and _tiendas_parecidas(t.get("tienda"), tienda)
-        ):
+        if _senales_similitud(t, tienda, fecha_n, total, precios)["duplicado"]:
             return t
     return None
+
+
+def diagnostico_duplicado(user_id: str, tienda, fecha, total, items=None) -> list:
+    """Para el panel de admin: por qué cada ticket guardado coincide o no."""
+    try:
+        total = float(total)
+    except (TypeError, ValueError):
+        total = 0.0
+    fecha_n = _normalizar_fecha(fecha)
+    precios = _precios(items)
+    filas = []
+    for t in obtener_historial(user_id):
+        sen = _senales_similitud(t, tienda, fecha_n, total, precios)
+        filas.append({
+            "guardado": f"{t.get('tienda')} · {t.get('fecha_ticket')} · {t.get('total')}",
+            **sen,
+        })
+    return filas
 
 
 def registrar_interes_premium(user_id: str, tipo: str) -> None:
@@ -415,24 +471,59 @@ def _a_datetime(ts):
         return None
 
 
-def obtener_metricas() -> dict:
+# Fecha desde la que se mide la "cohorte nueva": usuarios cuyo PRIMER análisis es de
+# ese día en adelante. Así se aísla la popularidad entre desconocidos sin borrar
+# nada: los testers anteriores quedan fuera de la cohorte y conservan su historial.
+# Se puede cambiar con la variable de entorno INICIO_MEDICION (formato AAAA-MM-DD).
+INICIO_MEDICION = os.environ.get("INICIO_MEDICION", "2026-11-06")
+
+
+def _inicio_medicion_dt(fecha_iso: str):
+    try:
+        return datetime.fromisoformat(f"{fecha_iso}T00:00:00").replace(tzinfo=ZONA_MADRID)
+    except ValueError:
+        return None
+
+
+def obtener_metricas(desde: str | None = None) -> dict:
     """Métricas para administración, basadas en el registro de eventos
     'analisis_ok' (no en el contador agregado por usuario) — así se puede
     reconstruir en qué días distintos volvió cada persona, en vez de solo
-    saber cuántos análisis hizo en total."""
+    saber cuántos análisis hizo en total.
+
+    Si 'desde' (AAAA-MM-DD) se indica, solo cuentan los usuarios de la cohorte
+    nueva: los que hicieron su primer análisis a partir de esa fecha."""
     try:
         eventos_analisis = list(
             eventos_col.where(filter=FieldFilter("tipo", "==", "analisis_ok")).stream()
         )
 
+        # 1. Fecha del primer análisis de cada usuario (sobre TODOS los eventos)
+        primer_analisis: dict[str, datetime] = {}
+        for ev in eventos_analisis:
+            d = ev.to_dict()
+            uid, dt = d.get("user_id"), _a_datetime(d.get("timestamp"))
+            if uid and dt and (uid not in primer_analisis or dt < primer_analisis[uid]):
+                primer_analisis[uid] = dt
+
+        # 2. Cohorte: todos, o solo quienes empezaron desde la fecha de inicio
+        corte = _inicio_medicion_dt(desde) if desde else None
+        if corte:
+            cohorte = {u for u, dt in primer_analisis.items() if dt >= corte}
+        else:
+            cohorte = set(primer_analisis)
+
+        # 3. Días de actividad y último análisis, solo de la cohorte
         dias_por_usuario: dict[str, set] = {}
         ultimo_analisis: dict[str, datetime] = {}
+        analisis_ok = 0
         for ev in eventos_analisis:
             d = ev.to_dict()
             uid = d.get("user_id")
             ts = d.get("timestamp")
-            if not uid or not ts:
+            if not uid or not ts or uid not in cohorte:
                 continue
+            analisis_ok += 1
             fecha_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
             dias_por_usuario.setdefault(uid, set()).add(fecha_str)
             dt = _a_datetime(ts)
@@ -442,7 +533,9 @@ def obtener_metricas() -> dict:
         limite_7d = datetime.now(ZONA_MADRID) - timedelta(days=7)
         activos_7d = sum(1 for dt in ultimo_analisis.values() if dt >= limite_7d)
 
-        total_usuarios = len(list(metricas_col.stream()))
+        # En modo cohorte, "usuarios totales" son los de la cohorte; en modo
+        # histórico, todos los documentos de usuario (como antes).
+        total_usuarios = len(cohorte) if corte else len(list(metricas_col.stream()))
         activados = len(dias_por_usuario)
         volvieron_otro_dia = sum(1 for dias in dias_por_usuario.values() if len(dias) > 1)
         retencion_pct = round(100 * volvieron_otro_dia / activados, 1) if activados else 0.0
@@ -451,8 +544,9 @@ def obtener_metricas() -> dict:
             if activados else 0.0
         )
 
-        analisis_ok = len(eventos_analisis)
         todos_tickets = [d.to_dict() for d in tickets_col.stream()]
+        if corte:
+            todos_tickets = [t for t in todos_tickets if t.get("user_id") in cohorte]
         gastos_manuales = sum(1 for t in todos_tickets if t.get("origen") == "manual")
         total_guardados = len(todos_tickets) - gastos_manuales
         tasa_guardado = round((total_guardados / analisis_ok * 100), 1) if analisis_ok else 0.0

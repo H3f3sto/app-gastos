@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -21,6 +22,15 @@ import db
 from auth import get_cookie_manager, obtener_user_id, introducir_codigo_manual
 
 ZONA_MADRID = ZoneInfo("Europe/Madrid")
+
+# Streamlit reemplazó use_container_width=True por width="stretch". Se detecta qué
+# versión hay instalada para no romper ni en local ni en Streamlit Cloud.
+_param_width = inspect.signature(st.dataframe).parameters.get("width")
+ANCHO_COMPLETO = (
+    {"width": "stretch"}
+    if _param_width is not None and _param_width.default == "stretch"
+    else {"use_container_width": True}
+)
 
 MAX_REINTENTOS = 3
 ESPERA_BASE_SEGUNDOS = {503: 4, 429: 15}
@@ -100,6 +110,14 @@ def _num(valor) -> float:
         return 0.0 if v != v else v
     except (TypeError, ValueError):
         return 0.0
+
+
+def _fmt_cantidad(v) -> str:
+    """1.0 -> '1', 0.5 -> '0.5' (sin los seis decimales por defecto)."""
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return ""
 
 
 def _estilo_fila_seleccion(fila):
@@ -445,7 +463,7 @@ with tab_scanner:
                 st.write("**Productos detectados (editable)** — marca los que quieres sumar a tu historial:")
                 edited_df = st.data_editor(
                     df, num_rows="dynamic",
-                    use_container_width=True,
+                    **ANCHO_COMPLETO,
                     column_config={
                         "incluir": st.column_config.CheckboxColumn(
                             "Incluir", default=True,
@@ -474,8 +492,8 @@ with tab_scanner:
                     "Total (€)": _num(it.get("precio_total")),
                 } for it in items])
                 st.dataframe(
-                    vista.style.apply(_estilo_fila_seleccion, axis=1).format({"Total (€)": "{:.2f}"}),
-                    use_container_width=True, hide_index=True,
+                    vista.style.apply(_estilo_fila_seleccion, axis=1).format({"Total (€)": "{:.2f}", "Cantidad": _fmt_cantidad}),
+                    **ANCHO_COMPLETO, hide_index=True,
                 )
 
             resumen = data.get("resumen_financiero", {})
@@ -507,9 +525,20 @@ with tab_scanner:
             # Duplicado por CONTENIDO (otra foto del mismo ticket): el hash solo
             # detecta archivos idénticos, esto compara tienda + fecha + total.
             similar = db.buscar_ticket_similar(
-                user_id, meta.get("tienda"), meta.get("fecha"), total_original
+                user_id, meta.get("tienda"), meta.get("fecha"), total_original, items
             )
             confirmar_dup = True
+            _admin = os.environ.get("ADMIN_KEY")
+            if _admin and st.query_params.get("clave") == _admin:
+                with st.expander("🔍 Diagnóstico de duplicados (solo admin)"):
+                    st.caption(
+                        f"Lectura actual → tienda: {meta.get('tienda')!r} · fecha: {meta.get('fecha')!r} · "
+                        f"total: {total_original} · productos: {len(items)}"
+                    )
+                    diag = db.diagnostico_duplicado(
+                        user_id, meta.get("tienda"), meta.get("fecha"), total_original, items
+                    )
+                    st.dataframe(pd.DataFrame(diag), **ANCHO_COMPLETO) if diag else st.write("Historial vacío.")
             if similar:
                 st.warning(
                     f"⚠️ **Parece que este ticket ya está en tu historial**: "
@@ -669,7 +698,7 @@ with tab_historial:
                         df_items["incluido"] = df_items["incluido"].map(lambda v: "✅" if v is not False else "⬜")
                     cols = ["incluido", "concepto_raw", "cantidad", "precio_unitario", "precio_total", "valor_final"]
                     df_items = df_items[[c for c in cols if c in df_items.columns]]
-                    st.dataframe(df_items, use_container_width=True)
+                    st.dataframe(df_items, **ANCHO_COMPLETO)
 
                 st.divider()
                 if st.button("🗑️ Borrar este ticket", key=f"borrar_{entrada['_doc_id']}"):
@@ -730,11 +759,11 @@ with tab_resumen:
         df_por_tienda = df_resumen.groupby("tienda")["total"].sum().reset_index()
         df_por_tienda.columns = ["Tienda", "Total (€)"]
         df_por_tienda = df_por_tienda.sort_values("Total (€)", ascending=False)
-        st.dataframe(df_por_tienda, use_container_width=True)
+        st.dataframe(df_por_tienda, **ANCHO_COMPLETO)
 
         st.divider()
         st.write("**Últimos tickets:**")
-        st.dataframe(df_resumen.sort_values("fecha", ascending=False), use_container_width=True)
+        st.dataframe(df_resumen.sort_values("fecha", ascending=False), **ANCHO_COMPLETO)
 
 # ─── TAB 4: PREMIUM (PAYWALL FICTICIO) ────────────────────────────────────────
 with tab_premium:
@@ -776,8 +805,19 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY")
 if ADMIN_KEY and st.query_params.get("clave") == ADMIN_KEY:
     st.divider()
     with st.expander("📊 Panel de métricas (solo admin)", expanded=True):
-        metricas = db.obtener_metricas()
-        
+        _op_nuevos = f"🆕 Usuarios nuevos desde el {db.INICIO_MEDICION}"
+        _op_todos = "📚 Todo el histórico"
+        vista_metricas = st.radio(
+            "Qué medir", [_op_nuevos, _op_todos], horizontal=True, label_visibility="collapsed",
+        )
+        st.caption(
+            "Usuarios nuevos = personas cuyo primer análisis fue a partir de esa fecha. "
+            "Los testers anteriores quedan fuera, pero conservan sus datos."
+            if vista_metricas == _op_nuevos else
+            "Incluye a todos los usuarios desde el principio, también a los primeros testers."
+        )
+        metricas = db.obtener_metricas(desde=db.INICIO_MEDICION if vista_metricas == _op_nuevos else None)
+
         c1, c2, c3 = st.columns(3)
         c1.metric("Usuarios totales", metricas["total_usuarios"])
         c2.metric("Activados", metricas["activados"], help="Analizaron al menos un ticket")
