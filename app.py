@@ -93,6 +93,24 @@ def analizar_ticket_con_reintento(chat, prompt, imagen, status_placeholder):
     raise ultimo_error
 
 
+def _num(valor) -> float:
+    """Convierte a float tolerando None, NaN y textos; si no se puede, 0."""
+    try:
+        v = float(valor)
+        return 0.0 if v != v else v
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _estilo_fila_seleccion(fila):
+    """Verde = se suma al historial; gris tachado = se muestra pero no se suma.
+    Colores con transparencia para que se vean bien en tema claro y oscuro."""
+    if str(fila["Estado"]).startswith("✅"):
+        return ["background-color: rgba(46, 160, 67, 0.28)"] * len(fila)
+    return ["color: rgba(128, 128, 128, 0.9); text-decoration: line-through; "
+            "background-color: rgba(128, 128, 128, 0.12)"] * len(fila)
+
+
 # Configuración del diseño
 st.set_page_config(
     page_title="Scanner de Tickets - MVP", page_icon="🧾", layout="wide"
@@ -151,9 +169,31 @@ if "hashes_analizados" not in st.session_state:
 if "guardando_ticket" not in st.session_state:
     st.session_state["guardando_ticket"] = False
 
+if "cola_tickets" not in st.session_state:
+    st.session_state["cola_tickets"] = []
+
+if "uploader_n" not in st.session_state:
+    st.session_state["uploader_n"] = 0
+
+if "version_seleccion" not in st.session_state:
+    st.session_state["version_seleccion"] = 0
+
+if "form_manual_n" not in st.session_state:
+    st.session_state["form_manual_n"] = 0
+
+if "aviso_manual" not in st.session_state:
+    st.session_state["aviso_manual"] = None
+
+if "aviso_tanda" not in st.session_state:
+    st.session_state["aviso_tanda"] = None
+
 # Encabezado principal
 st.title("🧾 Procesador Inteligente de Tickets y Recibos")
 st.caption("MVP · Gemini 3.6 Flash · Historial de gastos personal")
+st.info(
+    f"🧪 **Beta gratuita**: de momento puedes analizar hasta {db.LIMITE_TICKETS_FREE} documentos al mes. "
+    "Cuando la app salga al público, el límite gratuito y las condiciones pueden cambiar."
+)
 
 # Métricas en el panel lateral (Sidebar)
 restantes = db.tickets_restantes(user_id)
@@ -164,73 +204,115 @@ st.sidebar.caption("💡 Guarda este código. Si borras las cookies o cambias de
 introducir_codigo_manual(cookies)
 
 
-# ─── FUNCIÓN AUXILIAR DE PROCESAMIENTO ─────────────────────────────────────────
-def ejecutar_analisis_ticket(uploaded_file, hash_actual, status_placeholder):
-    """Procesa el documento (JPG, PNG, PDF) con Gemini."""
+# ─── FUNCIONES AUXILIARES DE PROCESAMIENTO ─────────────────────────────────────
+MAX_TICKETS_POR_TANDA = 5
+
+
+def analizar_documento(uploaded_file, hash_actual):
+    """Analiza UN documento con Gemini.
+    Devuelve (datos, None) si va bien o (None, mensaje_de_error) si falla."""
+    status_placeholder = st.empty()
     try:
         imagen_optimizada = convertir_a_imagen_pil(uploaded_file)
         chat = client.chats.create(model="models/gemini-3.6-flash")
         response = analizar_ticket_con_reintento(
             chat, PROMPT, imagen_optimizada, status_placeholder
         )
-        
-        # Descontar uso e incrementar contadores
+
+        # Gemini respondió: descontar uso e incrementar contadores
         db.incrementar_contador(user_id)
         db.registrar_analisis_ip(ip_cliente)
         st.session_state["hashes_analizados"].add(hash_actual)
-        
-        # Parsear JSON de Gemini
+
         texto = response.text.replace("```json", "").replace("```", "").strip()
         datos = json.loads(texto)
-        st.session_state["ticket_data"] = datos
         status_placeholder.empty()
-        st.success("¡Documento procesado correctamente!")
-        st.rerun()
+        return datos, None
     except genai_errors.ClientError as e:
         status_placeholder.empty()
         if getattr(e, "code", None) == 429:
             db.registrar_evento("analisis_error_429", user_id)
-            st.error("Límite de frecuencia de Gemini alcanzado. Espera un momento.")
-        else:
-            db.registrar_evento("analisis_error_otro", user_id)
-            st.error(f"Error al procesar el documento: {str(e)}")
+            return None, "Límite de frecuencia de Gemini alcanzado."
+        db.registrar_evento("analisis_error_otro", user_id)
+        return None, f"Error al procesar el documento: {e}"
     except genai_errors.ServerError:
         status_placeholder.empty()
         db.registrar_evento("analisis_error_503", user_id)
-        st.error("Gemini está saturado. Inténtalo de nuevo en unos minutos.")
+        return None, "Gemini está saturado."
     except Exception as e:
         status_placeholder.empty()
         db.registrar_evento("analisis_error_otro", user_id)
-        st.error(f"Error al procesar el documento: {str(e)}")
+        return None, f"Error al procesar el documento: {e}"
 
 
-# ─── VENTANA DE DIÁLOGO: ADVERTENCIA DE DUPLICADOS EN HISTORIAL ───────────────
-@st.dialog("⚠️ Documento ya registrado en tu historial")
-def mostrar_dialogo_duplicado(uploaded_file, hash_actual):
-    st.write(
-        "Detectamos que esta imagen o PDF **ya se encuentra guardado en tu historial de gastos**."
-    )
-    st.warning(
-        "Si decides analizarlo de nuevo, consumirás **1 intento** de tu cuota mensual."
-    )
-    st.write("¿Realmente deseas volver a analizarlo?")
+def procesar_tanda(archivos, permitir_duplicados):
+    """Analiza varios archivos en secuencia y deja los resultados en la cola de revisión."""
+    resultados, errores, duplicados_omitidos, sin_cupo = [], [], [], []
+    barra = st.progress(0.0, text="Preparando...")
 
-    col_si, col_no = st.columns(2)
-    with col_si:
-        if st.button("SÍ, analizar de nuevo", type="primary"):
-            status_placeholder = st.empty()
-            with st.spinner("⚡ Procesando documento..."):
-                ejecutar_analisis_ticket(uploaded_file, hash_actual, status_placeholder)
-    with col_no:
-        if st.button("NO, cancelar"):
-            st.rerun()
+    for i, f in enumerate(archivos):
+        barra.progress(i / len(archivos), text=f"Analizando {i + 1} de {len(archivos)}: {f.name}")
+        h = calcular_hash_archivo(f)
+
+        es_dup = h in st.session_state["hashes_analizados"] or db.ticket_existe_en_historial(user_id, h)
+        if es_dup and not permitir_duplicados:
+            duplicados_omitidos.append(f.name)
+            continue
+
+        # El cupo puede agotarse a mitad de tanda: se comprueba antes de cada llamada
+        if not (
+            db.puede_escanear(user_id)
+            and db.puede_ip_analizar(ip_cliente)
+            and db.puede_analizar_global()
+        ):
+            sin_cupo.append(f.name)
+            continue
+
+        datos, error = analizar_documento(f, h)
+        if error:
+            errores.append(f"{f.name}: {error}")
+        else:
+            resultados.append({"nombre": f.name, "hash": h, "datos": datos})
+
+    barra.progress(1.0, text="Tanda terminada")
+
+    # Cola de revisión: el primero pasa a revisión si no hay otro en curso
+    cola = st.session_state["cola_tickets"]
+    cola.extend(resultados)
+    if st.session_state["ticket_data"] is None and cola:
+        siguiente = cola.pop(0)
+        st.session_state["ticket_data"] = siguiente["datos"]
+        st.session_state["hash_imagen_actual"] = siguiente["hash"]
+        st.session_state["nombre_ticket_actual"] = siguiente["nombre"]
+
+    st.session_state["aviso_tanda"] = {
+        "ok": len(resultados), "errores": errores,
+        "duplicados": duplicados_omitidos, "sin_cupo": sin_cupo,
+    }
+    st.session_state["uploader_n"] += 1  # vacía el selector de archivos
+    st.rerun()
+
+
+def pasar_al_siguiente_ticket():
+    """Carga el siguiente ticket de la cola (o deja el panel vacío)."""
+    cola = st.session_state["cola_tickets"]
+    if cola:
+        siguiente = cola.pop(0)
+        st.session_state["ticket_data"] = siguiente["datos"]
+        st.session_state["hash_imagen_actual"] = siguiente["hash"]
+        st.session_state["nombre_ticket_actual"] = siguiente["nombre"]
+    else:
+        st.session_state["ticket_data"] = None
+        st.session_state["nombre_ticket_actual"] = None
 
 
 # Pestañas principales
-tab_scanner, tab_historial, tab_resumen = st.tabs([
+tab_scanner, tab_manual, tab_historial, tab_resumen, tab_premium = st.tabs([
     "📷 Escanear Documento",
+    "✍️ Gasto manual",
     "📋 Historial",
-    "📊 Resumen Mensual"
+    "📊 Resumen Mensual",
+    "⭐ Premium (próximamente)"
 ])
 
 # ─── TAB 1: SCANNER ───────────────────────────────────────────────────────────
@@ -242,7 +324,8 @@ with tab_scanner:
 
         limite_usuario_ok = db.puede_escanear(user_id)
         limite_ip_ok = db.puede_ip_analizar(ip_cliente)
-        puede_analizar = limite_usuario_ok and limite_ip_ok
+        limite_global_ok = db.puede_analizar_global()
+        puede_analizar = limite_usuario_ok and limite_ip_ok and limite_global_ok
 
         if not limite_usuario_ok:
             st.warning(
@@ -254,41 +337,92 @@ with tab_scanner:
                 "Se han hecho demasiados análisis desde tu conexión en la última hora. "
                 "Inténtalo de nuevo más tarde."
             )
+        elif not limite_global_ok:
+            st.warning(
+                "La app ha alcanzado hoy su capacidad máxima de análisis en la beta. "
+                "Vuelve mañana; tu historial sigue disponible."
+            )
 
-        uploaded_file = st.file_uploader(
-            "Selecciona o arrastra una imagen (JPG, PNG) o recibo PDF (Amazon, etc.)",
+        restantes_num = db.tickets_restantes(user_id)
+        cupo_tanda = MAX_TICKETS_POR_TANDA
+        if isinstance(restantes_num, int):
+            cupo_tanda = max(0, min(MAX_TICKETS_POR_TANDA, restantes_num))
+
+        archivos = st.file_uploader(
+            f"Selecciona o arrastra hasta {MAX_TICKETS_POR_TANDA} imágenes (JPG, PNG) o recibos PDF",
             type=["jpg", "jpeg", "png", "pdf"],
+            accept_multiple_files=True,
             disabled=not puede_analizar,
+            key=f"uploader_{st.session_state['uploader_n']}",
         )
 
-        if uploaded_file is not None:
-            if uploaded_file.name.lower().endswith(".pdf"):
-                st.info(f"📄 Archivo PDF cargado: **{uploaded_file.name}**")
-            else:
-                st.image(uploaded_file, caption="Vista previa del documento", width=400)
-            
-            # Calcular hash único
-            hash_actual = calcular_hash_archivo(uploaded_file)
-            st.session_state["hash_imagen_actual"] = hash_actual
+        if archivos and len(archivos) > MAX_TICKETS_POR_TANDA:
+            st.warning(
+                f"Has seleccionado {len(archivos)} archivos. Solo se analizarán los "
+                f"primeros {MAX_TICKETS_POR_TANDA} en cada tanda."
+            )
+        archivos_tanda = (archivos or [])[:MAX_TICKETS_POR_TANDA]
 
-            # Control de duplicados
-            ya_en_sesion = hash_actual in st.session_state["hashes_analizados"]
-            ya_en_historial_db = db.ticket_existe_en_historial(user_id, hash_actual)
-            es_duplicado = ya_en_sesion or ya_en_historial_db
+        if archivos_tanda:
+            if isinstance(restantes_num, int) and len(archivos_tanda) > cupo_tanda:
+                st.warning(
+                    f"Te quedan {restantes_num} análisis este mes: se procesarán solo los "
+                    f"primeros {cupo_tanda}."
+                )
 
-            if st.button("🔍 Analizar con Gemini", type="primary", disabled=not puede_analizar):
-                if es_duplicado:
-                    mostrar_dialogo_duplicado(uploaded_file, hash_actual)
-                else:
-                    status_placeholder = st.empty()
-                    with st.spinner("⚡ Optimizando documento y analizando..."):
-                        ejecutar_analisis_ticket(uploaded_file, hash_actual, status_placeholder)
+            # Vista previa compacta + aviso de duplicados
+            n_dup = 0
+            for f in archivos_tanda:
+                h = calcular_hash_archivo(f)
+                dup = h in st.session_state["hashes_analizados"] or db.ticket_existe_en_historial(user_id, h)
+                n_dup += dup
+                etiqueta = f"{'📄' if f.name.lower().endswith('.pdf') else '🖼️'} {f.name}"
+                st.caption(etiqueta + ("  ⚠️ ya registrado" if dup else ""))
+            if len(archivos_tanda) == 1 and not archivos_tanda[0].name.lower().endswith(".pdf"):
+                st.image(archivos_tanda[0], caption="Vista previa del documento", width=300)
+
+            permitir_dup = False
+            if n_dup:
+                permitir_dup = st.checkbox(
+                    f"Analizar también los {n_dup} ya registrados (consumen cuota)",
+                    key=f"permitir_dup_{st.session_state['uploader_n']}",
+                )
+                if not permitir_dup:
+                    st.info("Los documentos ya registrados se omitirán y no gastan cuota.")
+
+            etiqueta_boton = (
+                "🔍 Analizar con Gemini" if len(archivos_tanda) == 1
+                else f"🔍 Analizar {len(archivos_tanda)} documentos"
+            )
+            if st.button(etiqueta_boton, type="primary", disabled=not puede_analizar):
+                procesar_tanda(archivos_tanda[:max(cupo_tanda, 0)] if isinstance(restantes_num, int) else archivos_tanda, permitir_dup)
 
     with col_right:
         st.subheader("2. Resultados y Auditoría")
 
+        aviso = st.session_state.get("aviso_tanda")
+        if aviso:
+            if aviso["ok"]:
+                st.success(f"✅ {aviso['ok']} documento(s) analizado(s) correctamente.")
+            if aviso["duplicados"]:
+                st.info("Omitidos por estar ya registrados: " + ", ".join(aviso["duplicados"]))
+            if aviso["sin_cupo"]:
+                st.warning("Sin cupo suficiente para: " + ", ".join(aviso["sin_cupo"]))
+            for err in aviso["errores"]:
+                st.error(err)
+            st.session_state["aviso_tanda"] = None
+
         if st.session_state["ticket_data"] is not None:
             data = st.session_state["ticket_data"]
+            pendientes = len(st.session_state["cola_tickets"])
+            nombre_actual = st.session_state.get("nombre_ticket_actual")
+            if pendientes:
+                st.info(
+                    f"📥 Revisando **{nombre_actual or 'ticket'}** · "
+                    f"quedan {pendientes} más en cola"
+                )
+            elif nombre_actual:
+                st.caption(f"Revisando: {nombre_actual}")
             meta = data.get("metadatos", {})
 
             st.markdown(f"**Establecimiento:** {meta.get('tienda', 'N/A')}")
@@ -303,17 +437,64 @@ with tab_scanner:
                     "concepto_raw", "cantidad", "precio_unitario",
                     "precio_total", "gemini_original", "accion_usuario", "valor_final"
                 ]
-                df = df[[c for c in expected_cols if c in df.columns]]
-                st.write("**Productos detectados (editable):**")
+                if "incluir" not in df.columns:
+                    df.insert(0, "incluir", True)
+                df = df[["incluir"] + [c for c in expected_cols if c in df.columns]]
+                df["incluir"] = df["incluir"].fillna(True).astype(bool)
+
+                st.write("**Productos detectados (editable)** — marca los que quieres sumar a tu historial:")
                 edited_df = st.data_editor(
                     df, num_rows="dynamic",
-                    use_container_width=True, key="editor_items"
+                    use_container_width=True,
+                    column_config={
+                        "incluir": st.column_config.CheckboxColumn(
+                            "Incluir", default=True,
+                            help="Si lo desmarcas, el producto se sigue mostrando pero no se suma a tu gasto.",
+                        )
+                    },
+                    key=f"editor_items_{st.session_state.get('hash_imagen_actual')}_{st.session_state['version_seleccion']}"
                 )
+                edited_df["incluir"] = edited_df["incluir"].fillna(True).astype(bool)
                 items = edited_df.to_dict(orient="records")
 
+                # Marcar / desmarcar todos conservando las ediciones ya hechas
+                cb1, cb2, _ = st.columns([1, 1, 2])
+                for col_b, texto, valor in ((cb1, "☑️ Marcar todos", True), (cb2, "⬜ Desmarcar todos", False)):
+                    if col_b.button(texto, key=f"sel_{int(valor)}_{st.session_state['version_seleccion']}"):
+                        data["items"] = [{**it, "incluir": valor} for it in items]
+                        st.session_state["version_seleccion"] += 1
+                        st.rerun()
+
+                # Vista previa con color: verde = incluido, gris tachado = excluido
+                st.caption("Vista previa: 🟩 verde = se suma a tu historial · ⬜ gris tachado = se muestra, pero no se suma")
+                vista = pd.DataFrame([{
+                    "Estado": "✅ Incluido" if it.get("incluir", True) else "⬜ Excluido",
+                    "Producto": it.get("valor_final") or it.get("concepto_raw") or "",
+                    "Cantidad": it.get("cantidad"),
+                    "Total (€)": _num(it.get("precio_total")),
+                } for it in items])
+                st.dataframe(
+                    vista.style.apply(_estilo_fila_seleccion, axis=1).format({"Total (€)": "{:.2f}"}),
+                    use_container_width=True, hide_index=True,
+                )
+
             resumen = data.get("resumen_financiero", {})
-            total = resumen.get("total", 0.0)
-            st.metric(label="Total Calculado", value=f"{total:.2f} €")
+            total_original = _num(resumen.get("total", 0.0))
+            incluidos = [it for it in items if it.get("incluir", True)]
+            todos_incluidos = len(incluidos) == len(items)
+            # Con todo marcado se respeta el total del ticket (descuentos, redondeos);
+            # con selección parcial, la suma de los productos marcados.
+            total = total_original if todos_incluidos else round(sum(_num(it.get("precio_total")) for it in incluidos), 2)
+
+            mt1, mt2 = st.columns(2)
+            mt1.metric("Total del ticket", f"{total_original:.2f} €")
+            mt2.metric(
+                "Se sumará a tu historial", f"{total:.2f} €",
+                help=f"{len(incluidos)} de {len(items)} productos incluidos",
+            )
+            sin_seleccion = bool(items) and not incluidos
+            if sin_seleccion:
+                st.warning("No has marcado ningún producto. Marca al menos uno para poder guardar.")
 
             st.divider()
             
@@ -323,11 +504,30 @@ with tab_scanner:
             
             ya_guardado = st.session_state.get("ultimo_guardado_firma") == firma_ticket
 
+            # Duplicado por CONTENIDO (otra foto del mismo ticket): el hash solo
+            # detecta archivos idénticos, esto compara tienda + fecha + total.
+            similar = db.buscar_ticket_similar(
+                user_id, meta.get("tienda"), meta.get("fecha"), total_original
+            )
+            confirmar_dup = True
+            if similar:
+                st.warning(
+                    f"⚠️ **Parece que este ticket ya está en tu historial**: "
+                    f"{similar.get('tienda')} · {similar.get('fecha_ticket')} · "
+                    f"{float(similar.get('total', 0)):.2f} € "
+                    f"(registrado el {similar.get('fecha_registro')}). "
+                    "Puede ser otra foto del mismo ticket."
+                )
+                confirmar_dup = st.checkbox(
+                    "Es un ticket distinto, guardar de todas formas",
+                    key=f"confirmar_dup_{st.session_state.get('hash_imagen_actual')}",
+                )
+
             # BOTÓN CORREGIDO: Guarda directamente sin colisión de callbacks ni congelamientos
             if st.button(
                 "💾 Guardar en historial", 
                 type="primary", 
-                disabled=ya_guardado or st.session_state["guardando_ticket"]
+                disabled=ya_guardado or st.session_state["guardando_ticket"] or not confirmar_dup or sin_seleccion
             ):
                 st.session_state["guardando_ticket"] = True
                 
@@ -337,8 +537,14 @@ with tab_scanner:
                     "fecha_ticket": meta.get("fecha", ""),
                     "nif_cif": meta.get("nif_cif", ""),
                     "total": total,
+                    "total_original": total_original,
                     "num_productos": len(items),
-                    "items": items,
+                    "num_incluidos": len(incluidos),
+                    "items": [
+                        {**{k: v for k, v in it.items() if k != "incluir"},
+                         "incluido": bool(it.get("incluir", True))}
+                        for it in items
+                    ],
                     "hash_imagen": st.session_state.get("hash_imagen_actual")
                 }
                 
@@ -349,13 +555,83 @@ with tab_scanner:
                 
                 if exito:
                     st.session_state["ultimo_guardado_firma"] = firma_ticket
-                    st.session_state["ticket_data"] = None
-                    st.success(f"✅ Ticket de {meta.get('tienda', 'tienda')} guardado correctamente.")
+                    pasar_al_siguiente_ticket()
+                    st.toast(f"✅ Ticket de {meta.get('tienda', 'tienda')} guardado correctamente.")
                     st.rerun()
                 else:
                     st.warning("Este ticket ya se encuentra registrado en la base de datos.")
+
+            if st.button("🗑️ Descartar este ticket (sin guardar)"):
+                pasar_al_siguiente_ticket()
+                st.rerun()
         else:
             st.info("Sube una imagen o PDF y pulsa 'Analizar con Gemini' para ver los resultados.")
+
+# ─── TAB: GASTO MANUAL ────────────────────────────────────────────────────────
+with tab_manual:
+    st.subheader("✍️ Añadir un gasto sin ticket")
+    st.caption(
+        "Para compras pequeñas en las que no te dan ticket o se te olvidó pedirlo. "
+        "Cuenta igual que los demás en tu historial, resumen y CSV, y no gasta análisis."
+    )
+
+    if st.session_state.get("aviso_manual"):
+        st.success(st.session_state["aviso_manual"])
+        st.session_state["aviso_manual"] = None
+
+    n = st.session_state["form_manual_n"]
+    hoy = datetime.now(ZONA_MADRID).date()
+
+    cm1, cm2 = st.columns(2)
+    fecha_m = cm1.date_input("Fecha", value=hoy, max_value=hoy, format="DD/MM/YYYY", key=f"man_fecha_{n}")
+    importe_m = cm2.number_input("Importe (€)", min_value=0.0, step=0.5, format="%.2f", key=f"man_importe_{n}")
+    tienda_m = st.text_input(
+        "Tienda o concepto", max_chars=80,
+        placeholder="Ej.: Bazar de la esquina, café, parking...", key=f"man_tienda_{n}",
+    )
+    nota_m = st.text_input("Nota (opcional)", max_chars=200, key=f"man_nota_{n}")
+
+    fecha_txt = fecha_m.strftime("%d/%m/%Y")
+    valido_m = bool(tienda_m.strip()) and importe_m > 0
+
+    confirmar_m = True
+    if valido_m:
+        similar_m = db.buscar_ticket_similar(user_id, tienda_m, fecha_txt, importe_m)
+        if similar_m:
+            st.warning(
+                f"⚠️ Ya tienes un gasto parecido: {similar_m.get('tienda')} · "
+                f"{similar_m.get('fecha_ticket')} · {float(similar_m.get('total', 0)):.2f} €."
+            )
+            confirmar_m = st.checkbox("Es un gasto distinto, guardar de todas formas", key=f"man_conf_{n}")
+
+    if st.button("💾 Guardar gasto", type="primary", disabled=not valido_m or not confirmar_m, key=f"man_guardar_{n}"):
+        concepto = tienda_m.strip()
+        entrada = {
+            "fecha_registro": datetime.now(ZONA_MADRID).strftime("%Y-%m-%d %H:%M"),
+            "tienda": concepto,
+            "fecha_ticket": fecha_txt,
+            "nif_cif": "",
+            "total": round(float(importe_m), 2),
+            "num_productos": 1,
+            "items": [{
+                "concepto_raw": concepto,
+                "cantidad": 1.0,
+                "precio_unitario": round(float(importe_m), 2),
+                "precio_total": round(float(importe_m), 2),
+                "gemini_original": "",
+                "accion_usuario": "MANUAL",
+                "valor_final": concepto,
+            }],
+            "origen": "manual",
+            "nota": nota_m.strip(),
+            "hash_imagen": None,
+        }
+        if db.guardar_ticket(user_id, entrada):
+            st.session_state["aviso_manual"] = f"✅ Gasto de {importe_m:.2f} € en «{concepto}» guardado."
+            st.session_state["form_manual_n"] += 1  # vacía el formulario
+            st.rerun()
+        else:
+            st.error("No se ha podido guardar el gasto. Inténtalo de nuevo.")
 
 # Obtener historial de Firestore
 historial = db.obtener_historial(user_id)
@@ -368,13 +644,30 @@ with tab_historial:
         st.info("Aún no has guardado ningún ticket. Escanea uno y pulsa 'Guardar en historial'.")
     else:
         for entrada in historial:
-            with st.expander(f"🧾 {entrada['tienda']} — {entrada['fecha_ticket']} — {entrada['total']:.2f} €"):
+            icono = "✍️" if entrada.get("origen") == "manual" else "🧾"
+            with st.expander(f"{icono} {entrada['tienda']} — {entrada['fecha_ticket']} — {entrada['total']:.2f} €"):
                 st.markdown(f"**Registrado:** {entrada['fecha_registro']}")
-                st.markdown(f"**CIF/NIF:** {entrada['nif_cif']}")
-                st.markdown(f"**Productos:** {entrada['num_productos']}")
+                if entrada.get("origen") == "manual":
+                    st.markdown("**Origen:** gasto manual (sin ticket)")
+                    if entrada.get("nota"):
+                        st.markdown(f"**Nota:** {entrada['nota']}")
+                else:
+                    st.markdown(f"**CIF/NIF:** {entrada['nif_cif']}")
+                n_inc = entrada.get("num_incluidos", entrada["num_productos"])
+                if n_inc != entrada["num_productos"]:
+                    st.markdown(
+                        f"**Productos:** {entrada['num_productos']} en el ticket · "
+                        f"{n_inc} incluidos en tu gasto"
+                    )
+                    if entrada.get("total_original") is not None:
+                        st.markdown(f"**Total del ticket completo:** {float(entrada['total_original']):.2f} €")
+                else:
+                    st.markdown(f"**Productos:** {entrada['num_productos']}")
                 if entrada.get("items"):
                     df_items = pd.DataFrame(entrada["items"])
-                    cols = ["concepto_raw", "cantidad", "precio_unitario", "precio_total", "valor_final"]
+                    if "incluido" in df_items.columns:
+                        df_items["incluido"] = df_items["incluido"].map(lambda v: "✅" if v is not False else "⬜")
+                    cols = ["incluido", "concepto_raw", "cantidad", "precio_unitario", "precio_total", "valor_final"]
                     df_items = df_items[[c for c in cols if c in df_items.columns]]
                     st.dataframe(df_items, use_container_width=True)
 
@@ -391,7 +684,10 @@ with tab_historial:
             filas = []
             for entrada in historial:
                 for item in entrada.get("items", []):
+                    if item.get("incluido", True) is False:
+                        continue  # el CSV recoge solo lo que cuenta como gasto
                     filas.append({
+                        "origen": entrada.get("origen", "ticket"),
                         "fecha_registro": entrada["fecha_registro"],
                         "tienda": entrada["tienda"],
                         "fecha_ticket": entrada["fecha_ticket"],
@@ -440,6 +736,41 @@ with tab_resumen:
         st.write("**Últimos tickets:**")
         st.dataframe(df_resumen.sort_values("fecha", ascending=False), use_container_width=True)
 
+# ─── TAB 4: PREMIUM (PAYWALL FICTICIO) ────────────────────────────────────────
+with tab_premium:
+    st.subheader("⭐ Funciones en estudio para una futura versión Premium")
+    st.write(
+        "Todavía no existen: estamos decidiendo cuáles construir. "
+        "Marca las que te resultarían útiles. Tu opinión decide qué se desarrolla primero."
+    )
+
+    if "interes_enviado" not in st.session_state:
+        st.session_state["interes_enviado"] = set()
+
+    for clave, descripcion in db.FUNCIONES_PREMIUM.items():
+        c_txt, c_btn = st.columns([4, 1])
+        c_txt.write(descripcion)
+        enviado = clave in st.session_state["interes_enviado"]
+        if c_btn.button(
+            "✅ Anotado" if enviado else "👍 Me interesa",
+            key=f"interes_{clave}", disabled=enviado,
+        ):
+            db.registrar_interes_premium(user_id, f"interes_premium:{clave}")
+            st.session_state["interes_enviado"].add(clave)
+            st.rerun()
+
+    st.divider()
+    st.write("**Si existieran las funciones que has marcado, ¿cuánto pagarías al mes?**")
+    precio = st.radio(
+        "Precio mensual", list(db.OPCIONES_PRECIO.keys()),
+        format_func=lambda k: db.OPCIONES_PRECIO[k],
+        index=None, label_visibility="collapsed",
+    )
+    if st.button("Enviar respuesta", disabled=precio is None or st.session_state.get("precio_enviado", False)):
+        db.registrar_interes_premium(user_id, f"precio_premium:{precio}")
+        st.session_state["precio_enviado"] = True
+        st.success("¡Gracias! Tu respuesta se ha guardado.")
+
 # ─── PANEL ADMINISTRADOR ──────────────────────────────────────────────────────
 ADMIN_KEY = os.environ.get("ADMIN_KEY")
 if ADMIN_KEY and st.query_params.get("clave") == ADMIN_KEY:
@@ -457,3 +788,20 @@ if ADMIN_KEY and st.query_params.get("clave") == ADMIN_KEY:
         c5.metric("Retención (% de activados)", f"{metricas['retencion_pct']}%")
         c6.metric("Días activos / usuario", metricas["dias_activos_promedio"])
         c7.metric("% análisis que se guardan", f"{metricas['tasa_guardado_pct']}%")
+
+        c8, c9, _, _ = st.columns(4)
+        c8.metric(
+            "Activos últimos 7 días", metricas["activos_7d"],
+            help="Usuarios con al menos un análisis en los últimos 7 días",
+        )
+        c9.metric("Gastos manuales", metricas["gastos_manuales"], help="Gastos añadidos sin ticket")
+
+        st.divider()
+        st.write("**Interés en Premium (usuarios distintos):**")
+        interes = db.obtener_interes_premium()
+        cols_f = st.columns(len(db.FUNCIONES_PREMIUM))
+        for col, clave in zip(cols_f, db.FUNCIONES_PREMIUM):
+            col.metric(clave.replace("_", " ").capitalize(), interes.get(f"interes_premium:{clave}", 0))
+        cols_p = st.columns(len(db.OPCIONES_PRECIO))
+        for col, (clave, etiqueta) in zip(cols_p, db.OPCIONES_PRECIO.items()):
+            col.metric(f"Pagaría: {etiqueta.split(',')[0] if clave == '0' else etiqueta}", interes.get(f"precio_premium:{clave}", 0))

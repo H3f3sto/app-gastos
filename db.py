@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 
 import firebase_admin
@@ -65,9 +67,24 @@ tickets_col = db.collection("tickets")
 metricas_col = db.collection("metricas")
 ip_analisis_col = db.collection("ip_analisis")
 eventos_col = db.collection("eventos")
+config_col = db.collection("config")
 
-LIMITE_TICKETS_FREE = 20
+# Beta: límite mensual alto (casi ilimitado para un usuario normal). Al salir
+# al público, bajarlo y atarlo al plan de pago.
+LIMITE_TICKETS_FREE = 100
 LIMITE_ANALISIS_IP_POR_HORA = 15
+# Cortacircuitos: máximo de análisis al día entre TODOS los usuarios. Protege la
+# cuota compartida de Gemini (5 RPM) y la factura si algún día hay facturación.
+# Ajusta el valor a lo que permita tu cuota diaria real en AI Studio.
+LIMITE_GLOBAL_DIARIO = 200
+
+# Funciones candidatas a Premium (paywall ficticio para medir interés)
+FUNCIONES_PREMIUM = {
+    "comparador_precios": "Comparador de precios: cómo cambia el precio de un mismo producto entre fechas y tiendas",
+    "dividir_pagos": "Dividir pagos: marca qué productos pagaste tú y cuáles otra persona, y calcula cuánto debe cada uno",
+    "informes_mensuales": "Informes mensuales: resumen por producto y tienda, comparado con meses anteriores",
+}
+OPCIONES_PRECIO = {"0": "Nada, solo usaría la versión gratuita", "1.99": "1,99 €/mes", "2.99": "2,99 €/mes", "4.99": "4,99 €/mes"}
 
 
 ZONA_MADRID = ZoneInfo("Europe/Madrid")
@@ -82,6 +99,38 @@ def _ahora():
 
 def _mes_actual() -> str:
     return datetime.now(ZONA_MADRID).strftime("%Y-%m")
+
+
+def _hoy() -> str:
+    return datetime.now(ZONA_MADRID).strftime("%Y-%m-%d")
+
+
+def puede_analizar_global() -> bool:
+    """Cortacircuitos: False si ya se alcanzó el máximo diario entre todos los usuarios."""
+    try:
+        doc = config_col.document("uso_global").get()
+        if not doc.exists:
+            return True
+        data = doc.to_dict()
+        if data.get("dia") != _hoy():
+            return True
+        return data.get("analisis_dia", 0) < LIMITE_GLOBAL_DIARIO
+    except Exception as e:
+        print(f"Error comprobando límite global: {e}")
+        return True  # ante un fallo de lectura, no bloquear a los usuarios
+
+
+def registrar_analisis_global() -> None:
+    try:
+        ref = config_col.document("uso_global")
+        doc = ref.get()
+        hoy = _hoy()
+        if doc.exists and doc.to_dict().get("dia") == hoy:
+            ref.update({"analisis_dia": gcf_firestore.Increment(1)})
+        else:
+            ref.set({"dia": hoy, "analisis_dia": 1})
+    except Exception as e:
+        print(f"Error registrando uso global: {e}")
 
 
 def puede_escanear(user_id: str) -> bool:
@@ -145,6 +194,7 @@ def incrementar_contador(user_id: str) -> None:
                 "analisis_totales": gcf_firestore.Increment(1),
                 "ultima_actividad": _ahora()
             })
+    registrar_analisis_global()
     # Registrado fuera del if/else: cada análisis debe quedar con su propia
     # fecha, sea el primero del usuario o no — es lo que permite luego saber
     # en cuántos días distintos volvió cada persona.
@@ -204,7 +254,10 @@ def guardar_ticket(user_id: str, entrada: dict) -> bool:
 
         entrada = {**entrada, "user_id": user_id, "creado": _ahora()}
         tickets_col.add(entrada)
-        registrar_evento("ticket_guardado", user_id)
+        # Los gastos manuales no pasan por Gemini: se registran con otro tipo de
+        # evento para no distorsionar el "% de análisis que se guardan".
+        es_manual = entrada.get("origen") == "manual"
+        registrar_evento("gasto_manual" if es_manual else "ticket_guardado", user_id)
         return True
     except Exception as e:
         print(f"Error guardando ticket en Firestore: {e}")
@@ -235,6 +288,93 @@ def obtener_historial(user_id: str) -> list:
         return []
 
 
+def _normalizar_fecha(texto) -> str:
+    """Lleva fechas como '12/10/25', '12-10-2025' o '2025-10-12' a 'YYYY-MM-DD'.
+    Si no se reconoce el formato, devuelve el texto limpio."""
+    t = str(texto or "").strip()
+    m = re.search(r"(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})", t)
+    if m:
+        a, mes, d = m.groups()
+        return f"{int(a):04d}-{int(mes):02d}-{int(d):02d}"
+    m = re.search(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", t)
+    if m:
+        d, mes, a = m.groups()
+        a = int(a) + 2000 if int(a) < 100 else int(a)
+        return f"{a:04d}-{int(mes):02d}-{int(d):02d}"
+    return t.lower()
+
+
+def _normalizar_tienda(texto) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(texto or "").lower())
+
+
+def _tiendas_parecidas(a: str, b: str) -> bool:
+    na, nb = _normalizar_tienda(a), _normalizar_tienda(b)
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    return SequenceMatcher(None, na, nb).ratio() >= 0.7
+
+
+def buscar_ticket_similar(user_id: str, tienda, fecha, total):
+    """Detecta el MISMO ticket aunque venga de otra foto (el hash de imagen solo
+    detecta archivos idénticos). Criterio: misma fecha, mismo total (±1 céntimo)
+    y tienda parecida. Devuelve el ticket guardado o None. Si faltan fecha o
+    total no se puede decidir y devuelve None."""
+    try:
+        total = float(total)
+    except (TypeError, ValueError):
+        return None
+    fecha_n = _normalizar_fecha(fecha)
+    if not fecha_n or total <= 0:
+        return None
+
+    for t in obtener_historial(user_id):
+        try:
+            total_t = float(t.get("total", 0))
+        except (TypeError, ValueError):
+            continue
+        try:
+            total_orig_t = float(t.get("total_original", total_t))
+        except (TypeError, ValueError):
+            total_orig_t = total_t
+        # Se compara con el total guardado Y con el total original del ticket
+        # completo (si se guardó con selección parcial, 'total' es solo lo marcado).
+        if (
+            (abs(total_t - total) < 0.011 or abs(total_orig_t - total) < 0.011)
+            and _normalizar_fecha(t.get("fecha_ticket")) == fecha_n
+            and _tiendas_parecidas(t.get("tienda"), tienda)
+        ):
+            return t
+    return None
+
+
+def registrar_interes_premium(user_id: str, tipo: str) -> None:
+    """Guarda un voto de interés. tipo: 'interes_premium:<funcion>' o 'precio_premium:<valor>'."""
+    registrar_evento(tipo, user_id)
+
+
+def obtener_interes_premium() -> dict:
+    """Usuarios DISTINTOS que votaron cada función y cada opción de precio."""
+    tipos = (
+        [f"interes_premium:{k}" for k in FUNCIONES_PREMIUM]
+        + [f"precio_premium:{k}" for k in OPCIONES_PRECIO]
+    )
+    resultado = {t: 0 for t in tipos}
+    try:
+        usuarios = {t: set() for t in tipos}
+        for ev in eventos_col.where(filter=FieldFilter("tipo", "in", tipos)).stream():
+            d = ev.to_dict()
+            if d.get("user_id") in (None, ""):
+                continue
+            usuarios[d["tipo"]].add(d["user_id"])
+        resultado = {t: len(u) for t, u in usuarios.items()}
+    except Exception as e:
+        print(f"Error obteniendo interés premium: {e}")
+    return resultado
+
+
 def borrar_ticket(user_id: str, doc_id: str) -> bool:
     """Elimina un ticket del usuario."""
     try:
@@ -261,6 +401,20 @@ def registrar_evento(tipo_evento: str, user_id: str) -> None:
         print(f"Error registrando evento: {e}")
 
 
+def _a_datetime(ts):
+    """Convierte un timestamp de evento (datetime o string ISO) a datetime
+    con zona horaria. Los eventos antiguos pueden estar en UTC (datetime) o
+    sin zona; los nuevos son strings ISO en hora de Madrid."""
+    try:
+        if not hasattr(ts, "strftime"):
+            ts = datetime.fromisoformat(str(ts))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=ZONA_MADRID)
+        return ts
+    except Exception:
+        return None
+
+
 def obtener_metricas() -> dict:
     """Métricas para administración, basadas en el registro de eventos
     'analisis_ok' (no en el contador agregado por usuario) — así se puede
@@ -272,6 +426,7 @@ def obtener_metricas() -> dict:
         )
 
         dias_por_usuario: dict[str, set] = {}
+        ultimo_analisis: dict[str, datetime] = {}
         for ev in eventos_analisis:
             d = ev.to_dict()
             uid = d.get("user_id")
@@ -280,6 +435,12 @@ def obtener_metricas() -> dict:
                 continue
             fecha_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
             dias_por_usuario.setdefault(uid, set()).add(fecha_str)
+            dt = _a_datetime(ts)
+            if dt and (uid not in ultimo_analisis or dt > ultimo_analisis[uid]):
+                ultimo_analisis[uid] = dt
+
+        limite_7d = datetime.now(ZONA_MADRID) - timedelta(days=7)
+        activos_7d = sum(1 for dt in ultimo_analisis.values() if dt >= limite_7d)
 
         total_usuarios = len(list(metricas_col.stream()))
         activados = len(dias_por_usuario)
@@ -291,7 +452,9 @@ def obtener_metricas() -> dict:
         )
 
         analisis_ok = len(eventos_analisis)
-        total_guardados = len(list(tickets_col.stream()))
+        todos_tickets = [d.to_dict() for d in tickets_col.stream()]
+        gastos_manuales = sum(1 for t in todos_tickets if t.get("origen") == "manual")
+        total_guardados = len(todos_tickets) - gastos_manuales
         tasa_guardado = round((total_guardados / analisis_ok * 100), 1) if analisis_ok else 0.0
 
         return {
@@ -299,6 +462,8 @@ def obtener_metricas() -> dict:
             "activados": activados,
             "total_analisis_ok": analisis_ok,
             "volvieron_otro_dia": volvieron_otro_dia,
+            "activos_7d": activos_7d,
+            "gastos_manuales": gastos_manuales,
             "retencion_pct": retencion_pct,
             "dias_activos_promedio": dias_activos_promedio,
             "tasa_guardado_pct": tasa_guardado
@@ -307,6 +472,6 @@ def obtener_metricas() -> dict:
         print(f"Error obteniendo métricas: {e}")
         return {
             "total_usuarios": 0, "activados": 0, "total_analisis_ok": 0,
-            "volvieron_otro_dia": 0, "retencion_pct": 0, "dias_activos_promedio": 0,
+            "volvieron_otro_dia": 0, "activos_7d": 0, "gastos_manuales": 0, "retencion_pct": 0, "dias_activos_promedio": 0,
             "tasa_guardado_pct": 0
         }
