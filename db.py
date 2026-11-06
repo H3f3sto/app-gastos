@@ -84,7 +84,7 @@ FUNCIONES_PREMIUM = {
     "dividir_pagos": "Dividir pagos: marca qué productos pagaste tú y cuáles otra persona, y calcula cuánto debe cada uno",
     "informes_mensuales": "Informes mensuales: resumen por producto y tienda, comparado con meses anteriores",
 }
-OPCIONES_PRECIO = {"0": "Nada, solo usaría la versión gratuita", "1.99": "1,99 €/mes", "2.99": "2,99 €/mes", "4.99": "4,99 €/mes"}
+OPCIONES_PRECIO = {"0": "Nada, solo usaría la versión gratuita", "4.99": "4,99 €/mes", "7.99": "7,99 €/mes", "9.99": "9,99 €/mes"}
 
 
 ZONA_MADRID = ZoneInfo("Europe/Madrid")
