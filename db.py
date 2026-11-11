@@ -69,14 +69,34 @@ ip_analisis_col = db.collection("ip_analisis")
 eventos_col = db.collection("eventos")
 config_col = db.collection("config")
 
-# Beta: límite mensual alto (casi ilimitado para un usuario normal). Al salir
-# al público, bajarlo y atarlo al plan de pago.
-LIMITE_TICKETS_FREE = 100
+# Límites con facturación de Google Cloud activada (techo de gasto: ~20 €/mes).
+LIMITE_TICKETS_FREE = 50          # análisis por usuario y mes
 LIMITE_ANALISIS_IP_POR_HORA = 15
-# Cortacircuitos: máximo de análisis al día entre TODOS los usuarios. Protege la
-# cuota compartida de Gemini (5 RPM) y la factura si algún día hay facturación.
-# Ajusta el valor a lo que permita tu cuota diaria real en AI Studio.
-LIMITE_GLOBAL_DIARIO = 200
+# Cortacircuito 1: máximo de análisis al día entre TODOS los usuarios.
+LIMITE_GLOBAL_DIARIO = 60
+# Cortacircuito 2 (el que de verdad protege tu dinero): presupuesto mensual en
+# dólares. Cuando el coste ESTIMADO del mes lo alcanza, la app deja de analizar
+# hasta el mes siguiente. 22 USD ≈ 20 €; ajusta con la variable de entorno
+# PRESUPUESTO_MENSUAL_USD si cambia el tipo de cambio o tu techo.
+PRESUPUESTO_MENSUAL_USD = float(os.environ.get("PRESUPUESTO_MENSUAL_USD", "22"))
+
+
+def _precios_por_millon(dt=None) -> tuple:
+    """(entrada, salida) en USD por millón de tokens de Gemini 3.6 Flash, según la
+    página oficial de precios: suben el 1-ene-2027. Revísalo si cambian."""
+    dt = dt or datetime.now(ZONA_MADRID)
+    return (0.75, 3.75) if dt < datetime(2027, 1, 1, tzinfo=ZONA_MADRID) else (1.50, 7.50)
+
+
+def calcular_coste_usd(tokens_entrada, tokens_salida) -> float:
+    """Coste estimado de un análisis. 'tokens_salida' debe incluir el razonamiento."""
+    try:
+        p_in, p_out = _precios_por_millon()
+        return round(
+            (float(tokens_entrada or 0) * p_in + float(tokens_salida or 0) * p_out) / 1_000_000, 6
+        )
+    except (TypeError, ValueError):
+        return 0.0
 
 # Funciones candidatas a Premium (paywall ficticio para medir interés)
 FUNCIONES_PREMIUM = {
@@ -106,29 +126,47 @@ def _hoy() -> str:
 
 
 def puede_analizar_global() -> bool:
-    """Cortacircuitos: False si ya se alcanzó el máximo diario entre todos los usuarios."""
+    """Cortacircuitos: False si se alcanzó el máximo diario de análisis (entre todos
+    los usuarios) o el presupuesto mensual estimado en dólares."""
     try:
         doc = config_col.document("uso_global").get()
         if not doc.exists:
             return True
         data = doc.to_dict()
-        if data.get("dia") != _hoy():
-            return True
-        return data.get("analisis_dia", 0) < LIMITE_GLOBAL_DIARIO
+        if data.get("dia") == _hoy() and data.get("analisis_dia", 0) >= LIMITE_GLOBAL_DIARIO:
+            return False
+        if data.get("mes") == _mes_actual() and data.get("coste_mes_usd", 0.0) >= PRESUPUESTO_MENSUAL_USD:
+            return False
+        return True
     except Exception as e:
         print(f"Error comprobando límite global: {e}")
         return True  # ante un fallo de lectura, no bloquear a los usuarios
 
 
-def registrar_analisis_global() -> None:
+def obtener_uso_global() -> dict:
+    """Para el panel: análisis de hoy y gasto estimado del mes."""
+    try:
+        doc = config_col.document("uso_global").get()
+        data = doc.to_dict() if doc.exists else {}
+    except Exception as e:
+        print(f"Error leyendo uso global: {e}")
+        data = {}
+    return {
+        "analisis_hoy": data.get("analisis_dia", 0) if data.get("dia") == _hoy() else 0,
+        "coste_mes_usd": round(data.get("coste_mes_usd", 0.0), 4) if data.get("mes") == _mes_actual() else 0.0,
+    }
+
+
+def registrar_analisis_global(coste_usd: float = 0.0) -> None:
     try:
         ref = config_col.document("uso_global")
         doc = ref.get()
-        hoy = _hoy()
-        if doc.exists and doc.to_dict().get("dia") == hoy:
-            ref.update({"analisis_dia": gcf_firestore.Increment(1)})
-        else:
-            ref.set({"dia": hoy, "analisis_dia": 1})
+        data = doc.to_dict() if doc.exists else {}
+        hoy, mes = _hoy(), _mes_actual()
+        # Si cambia el día o el mes, ese contador vuelve a empezar
+        analisis_dia = (data.get("analisis_dia", 0) if data.get("dia") == hoy else 0) + 1
+        coste_mes = (data.get("coste_mes_usd", 0.0) if data.get("mes") == mes else 0.0) + (coste_usd or 0.0)
+        ref.set({"dia": hoy, "analisis_dia": analisis_dia, "mes": mes, "coste_mes_usd": round(coste_mes, 6)})
     except Exception as e:
         print(f"Error registrando uso global: {e}")
 
@@ -165,8 +203,10 @@ def tickets_restantes(user_id: str) -> int:
     return max(0, LIMITE_TICKETS_FREE - usados)
 
 
-def incrementar_contador(user_id: str) -> None:
-    """Incrementa los contadores de uso del usuario."""
+def incrementar_contador(user_id: str, tokens_entrada=None, tokens_salida=None) -> None:
+    """Incrementa los contadores de uso del usuario y guarda los tokens y el coste
+    estimado del análisis (si Gemini los devolvió)."""
+    coste_usd = calcular_coste_usd(tokens_entrada, tokens_salida) if tokens_entrada else 0.0
     doc_ref = metricas_col.document(user_id)
     doc = doc_ref.get()
     mes_actual = _mes_actual()
@@ -194,11 +234,15 @@ def incrementar_contador(user_id: str) -> None:
                 "analisis_totales": gcf_firestore.Increment(1),
                 "ultima_actividad": _ahora()
             })
-    registrar_analisis_global()
+    registrar_analisis_global(coste_usd)
     # Registrado fuera del if/else: cada análisis debe quedar con su propia
     # fecha, sea el primero del usuario o no — es lo que permite luego saber
     # en cuántos días distintos volvió cada persona.
-    registrar_evento("analisis_ok", user_id)
+    registrar_evento(
+        "analisis_ok", user_id,
+        {"tokens_entrada": tokens_entrada, "tokens_salida": tokens_salida, "coste_usd": coste_usd}
+        if tokens_entrada else None,
+    )
 
 
 def puede_ip_analizar(ip_cliente: str) -> bool:
@@ -445,14 +489,17 @@ def borrar_ticket(user_id: str, doc_id: str) -> bool:
         return False
 
 
-def registrar_evento(tipo_evento: str, user_id: str) -> None:
-    """Métricas y eventos."""
+def registrar_evento(tipo_evento: str, user_id: str, extra: dict | None = None) -> None:
+    """Métricas y eventos. 'extra' añade campos al evento (p. ej. tokens y coste)."""
     try:
-        eventos_col.add({
+        doc = {
             "tipo": tipo_evento,
             "user_id": user_id,
             "timestamp": _ahora()
-        })
+        }
+        if extra:
+            doc.update(extra)
+        eventos_col.add(doc)
     except Exception as e:
         print(f"Error registrando evento: {e}")
 
@@ -517,6 +564,7 @@ def obtener_metricas(desde: str | None = None) -> dict:
         dias_por_usuario: dict[str, set] = {}
         ultimo_analisis: dict[str, datetime] = {}
         analisis_ok = 0
+        suma_coste, n_con_coste, suma_tok_in, suma_tok_out = 0.0, 0, 0, 0
         for ev in eventos_analisis:
             d = ev.to_dict()
             uid = d.get("user_id")
@@ -524,6 +572,11 @@ def obtener_metricas(desde: str | None = None) -> dict:
             if not uid or not ts or uid not in cohorte:
                 continue
             analisis_ok += 1
+            if d.get("coste_usd"):
+                n_con_coste += 1
+                suma_coste += float(d["coste_usd"])
+                suma_tok_in += int(d.get("tokens_entrada") or 0)
+                suma_tok_out += int(d.get("tokens_salida") or 0)
             fecha_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
             dias_por_usuario.setdefault(uid, set()).add(fecha_str)
             dt = _a_datetime(ts)
@@ -560,12 +613,17 @@ def obtener_metricas(desde: str | None = None) -> dict:
             "gastos_manuales": gastos_manuales,
             "retencion_pct": retencion_pct,
             "dias_activos_promedio": dias_activos_promedio,
-            "tasa_guardado_pct": tasa_guardado
+            "tasa_guardado_pct": tasa_guardado,
+            "coste_medio_usd": round(suma_coste / n_con_coste, 5) if n_con_coste else 0.0,
+            "tokens_medios_entrada": round(suma_tok_in / n_con_coste) if n_con_coste else 0,
+            "tokens_medios_salida": round(suma_tok_out / n_con_coste) if n_con_coste else 0,
+            "analisis_con_coste": n_con_coste,
         }
     except Exception as e:
         print(f"Error obteniendo métricas: {e}")
         return {
             "total_usuarios": 0, "activados": 0, "total_analisis_ok": 0,
             "volvieron_otro_dia": 0, "activos_7d": 0, "gastos_manuales": 0, "retencion_pct": 0, "dias_activos_promedio": 0,
-            "tasa_guardado_pct": 0
+            "tasa_guardado_pct": 0, "coste_medio_usd": 0.0, "tokens_medios_entrada": 0,
+            "tokens_medios_salida": 0, "analisis_con_coste": 0
         }

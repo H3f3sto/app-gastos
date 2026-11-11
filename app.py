@@ -238,7 +238,12 @@ def analizar_documento(uploaded_file, hash_actual):
         )
 
         # Gemini respondió: descontar uso e incrementar contadores
-        db.incrementar_contador(user_id)
+        # Tokens que Gemini declara haber usado (la salida incluye el razonamiento)
+        uso = getattr(response, "usage_metadata", None)
+        t_in = getattr(uso, "prompt_token_count", None)
+        t_total = getattr(uso, "total_token_count", None)
+        t_out = (t_total - t_in) if isinstance(t_in, int) and isinstance(t_total, int) else None
+        db.incrementar_contador(user_id, t_in, t_out)
         db.registrar_analisis_ip(ip_cliente)
         st.session_state["hashes_analizados"].add(hash_actual)
 
@@ -366,8 +371,13 @@ with tab_scanner:
         if isinstance(restantes_num, int):
             cupo_tanda = max(0, min(MAX_TICKETS_POR_TANDA, restantes_num))
 
+        st.markdown(
+            f"📸 **Puedes subir varios tickets a la vez (hasta {MAX_TICKETS_POR_TANDA}).** "
+            "Pulsa **Browse files** y, en la galería del móvil, **mantén pulsada una foto** y marca "
+            "las demás (en ordenador, también puedes arrastrarlas aquí)."
+        )
         archivos = st.file_uploader(
-            f"Selecciona o arrastra hasta {MAX_TICKETS_POR_TANDA} imágenes (JPG, PNG) o recibos PDF",
+            f"Fotos de tickets (JPG, PNG) o recibos PDF · hasta {MAX_TICKETS_POR_TANDA} a la vez",
             type=["jpg", "jpeg", "png", "pdf"],
             accept_multiple_files=True,
             disabled=not puede_analizar,
@@ -457,10 +467,18 @@ with tab_scanner:
                 ]
                 if "incluir" not in df.columns:
                     df.insert(0, "incluir", True)
-                df = df[["incluir"] + [c for c in expected_cols if c in df.columns]]
+                if "mi_parte" not in df.columns:
+                    df["mi_parte"] = 100.0
+                df["mi_parte"] = pd.to_numeric(df["mi_parte"], errors="coerce").fillna(100.0)
+                orden = ["incluir", "concepto_raw", "cantidad", "precio_total", "mi_parte"]
+                resto = [c for c in expected_cols if c in df.columns and c not in orden]
+                df = df[[c for c in orden if c in df.columns] + resto]
                 df["incluir"] = df["incluir"].fillna(True).astype(bool)
 
-                st.write("**Productos detectados (editable)** — marca los que quieres sumar a tu historial:")
+                st.write(
+                    "**Productos detectados (editable)** — marca los que quieres sumar a tu historial. "
+                    "¿Pagaste a medias? Cambia **Mi parte (%)** (50 = la mitad)."
+                )
                 edited_df = st.data_editor(
                     df, num_rows="dynamic",
                     **ANCHO_COMPLETO,
@@ -468,12 +486,29 @@ with tab_scanner:
                         "incluir": st.column_config.CheckboxColumn(
                             "Incluir", default=True,
                             help="Si lo desmarcas, el producto se sigue mostrando pero no se suma a tu gasto.",
-                        )
+                        ),
+                        "mi_parte": st.column_config.NumberColumn(
+                            "Mi parte (%)", default=100.0, min_value=0.0, max_value=100.0, step=5.0,
+                            help="Porcentaje del producto que pagas tú. 50 = la mitad (p. ej. lo compartiste con otra persona).",
+                        ),
                     },
                     key=f"editor_items_{st.session_state.get('hash_imagen_actual')}_{st.session_state['version_seleccion']}"
                 )
                 edited_df["incluir"] = edited_df["incluir"].fillna(True).astype(bool)
+                edited_df["mi_parte"] = pd.to_numeric(edited_df["mi_parte"], errors="coerce").fillna(100.0).clip(0, 100)
                 items = edited_df.to_dict(orient="records")
+
+                # Atajo: dividir todo el ticket a partes iguales
+                cd1, cd2, _ = st.columns([2, 1, 1])
+                n_pers = cd1.selectbox(
+                    "Pagado entre varias personas (a partes iguales)",
+                    [1, 2, 3, 4, 5, 6], format_func=lambda n: "Solo yo" if n == 1 else f"Entre {n} personas",
+                    key=f"n_pers_{st.session_state['version_seleccion']}",
+                )
+                if cd2.button("Aplicar", key=f"aplicar_div_{st.session_state['version_seleccion']}"):
+                    data["items"] = [{**it, "mi_parte": round(100 / n_pers, 2)} for it in items]
+                    st.session_state["version_seleccion"] += 1
+                    st.rerun()
 
                 # Marcar / desmarcar todos conservando las ediciones ya hechas
                 cb1, cb2, _ = st.columns([1, 1, 2])
@@ -490,9 +525,12 @@ with tab_scanner:
                     "Producto": it.get("valor_final") or it.get("concepto_raw") or "",
                     "Cantidad": it.get("cantidad"),
                     "Total (€)": _num(it.get("precio_total")),
+                    "Mi parte (%)": _num(it.get("mi_parte", 100)),
+                    "Mi parte (€)": round(_num(it.get("precio_total")) * _num(it.get("mi_parte", 100)) / 100, 2),
                 } for it in items])
                 st.dataframe(
-                    vista.style.apply(_estilo_fila_seleccion, axis=1).format({"Total (€)": "{:.2f}", "Cantidad": _fmt_cantidad}),
+                    vista.style.apply(_estilo_fila_seleccion, axis=1).format(
+                        {"Total (€)": "{:.2f}", "Mi parte (€)": "{:.2f}", "Mi parte (%)": "{:.0f}", "Cantidad": _fmt_cantidad}),
                     **ANCHO_COMPLETO, hide_index=True,
                 )
 
@@ -500,9 +538,13 @@ with tab_scanner:
             total_original = _num(resumen.get("total", 0.0))
             incluidos = [it for it in items if it.get("incluir", True)]
             todos_incluidos = len(incluidos) == len(items)
-            # Con todo marcado se respeta el total del ticket (descuentos, redondeos);
-            # con selección parcial, la suma de los productos marcados.
-            total = total_original if todos_incluidos else round(sum(_num(it.get("precio_total")) for it in incluidos), 2)
+            todo_entero = all(_num(it.get("mi_parte", 100)) >= 100 for it in incluidos)
+            # Con todo marcado y al 100 % se respeta el total del ticket (descuentos, redondeos);
+            # en otro caso, la suma de tu parte de los productos marcados.
+            total = (
+                total_original if (todos_incluidos and todo_entero)
+                else round(sum(_num(it.get("precio_total")) * _num(it.get("mi_parte", 100)) / 100 for it in incluidos), 2)
+            )
 
             mt1, mt2 = st.columns(2)
             mt1.metric("Total del ticket", f"{total_original:.2f} €")
@@ -835,6 +877,21 @@ if ADMIN_KEY and st.query_params.get("clave") == ADMIN_KEY:
             help="Usuarios con al menos un análisis en los últimos 7 días",
         )
         c9.metric("Gastos manuales", metricas["gastos_manuales"], help="Gastos añadidos sin ticket")
+
+        # Coste de Gemini: medido con los tokens reales de cada análisis
+        uso_g = db.obtener_uso_global()
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(
+            "Coste medio por ticket", f"{metricas['coste_medio_usd'] * 100:.2f} cént. USD",
+            help=f"Medido en {metricas['analisis_con_coste']} análisis · "
+                 f"{metricas['tokens_medios_entrada']} tokens de entrada y "
+                 f"{metricas['tokens_medios_salida']} de salida de media (incluye razonamiento).",
+        )
+        k2.metric(
+            "Gasto estimado del mes", f"{uso_g['coste_mes_usd']:.2f} USD",
+            help=f"Presupuesto mensual: {db.PRESUPUESTO_MENSUAL_USD:.0f} USD. Al alcanzarlo, la app deja de analizar.",
+        )
+        k3.metric("Análisis hoy (todos)", f"{uso_g['analisis_hoy']} / {db.LIMITE_GLOBAL_DIARIO}")
 
         st.divider()
         st.write("**Interés en Premium (usuarios distintos):**")
